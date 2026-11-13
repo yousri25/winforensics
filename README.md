@@ -28,6 +28,7 @@ Zimmerman's GUI tools are WPF/WinForms apps built with DevExpress. Under Wine th
 ```bash
 git clone https://github.com/yousri25/winforensics.git
 cd winforensics
+chmod +x install.sh uninstall.sh bin/winforensics
 ./install.sh
 ```
 
