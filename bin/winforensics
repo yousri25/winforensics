@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# winforensics - start a Windows VM in Docker, open it over RDP,
+# and stop the VM again when the RDP window is closed.
+set -u
+
+CONF_DIR="${WINFORENSICS_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/winforensics}"
+ENV_FILE="$CONF_DIR/config.env"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/winforensics"
+LOG_FILE="$STATE_DIR/rdp.log"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/winforensics.lock"
+CONTAINER="WinForensics"
+RDP_HOST="127.0.0.1"
+RDP_PORT="3389"
+
+notify() {
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send "Windows Forensics" "$1" 2>/dev/null || true
+    fi
+}
+die() { printf 'winforensics: %s\n' "$*" >&2; notify "$*"; exit 1; }
+
+usage() {
+    cat <<USAGE
+Usage: winforensics [command]
+
+  (none) | start   Start the VM, open RDP, stop the VM when the window closes
+  stop             Stop the VM now
+  status           Show whether the VM is running
+  doctor           Check dependencies and configuration
+  help             Show this help
+
+Config: $ENV_FILE
+USAGE
+}
+
+# Reads KEY=value lines from config.env. The file is parsed, not sourced, so
+# values may contain spaces (e.g. WF_RDP_FLAGS=-gfx /gdi:sw) and nothing is executed.
+load_config() {
+    [ -f "$ENV_FILE" ] || die "config not found: $ENV_FILE (run install.sh first)"
+    local line key val
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        case "$line" in ''|'#'*) continue ;; esac
+        key="${line%%=*}"
+        val="${line#*=}"
+        if [[ "$key" =~ ^WF_[A-Z0-9_]+$ ]]; then export "$key=$val"; fi
+    done < "$ENV_FILE"
+
+    WF_STOP_ON_EXIT="${WF_STOP_ON_EXIT:-true}"
+    WF_BOOT_DELAY="${WF_BOOT_DELAY:-20}"
+    WF_BOOT_TIMEOUT="${WF_BOOT_TIMEOUT:-5400}"
+    WF_RDP_FLAGS="${WF_RDP_FLAGS--gfx /gdi:sw}"
+}
+
+compose() {
+    local args=(--project-name winforensics --env-file "$ENV_FILE" --file "$CONF_DIR/compose.yaml")
+    if [ -f "$CONF_DIR/compose.iso.yaml" ]; then
+        args+=(--file "$CONF_DIR/compose.iso.yaml")
+    fi
+    docker compose "${args[@]}" "$@"
+}
+
+find_rdp_client() {
+    local c
+    for c in xfreerdp3 sdl-freerdp3 wlfreerdp3; do
+        if command -v "$c" >/dev/null 2>&1; then RDP_CLIENT="$c"; return 0; fi
+    done
+    return 1
+}
+
+# True once Windows itself answers on the RDP port. A plain TCP connect is not
+# enough: Docker's port proxy accepts connections before Windows is installed or
+# booted. So send an RDP connection request and wait for any reply byte.
+rdp_ready() (
+    exec 3<>"/dev/tcp/$RDP_HOST/$RDP_PORT" || exit 1
+    printf '\x03\x00\x00\x13\x0e\xe0\x00\x00\x00\x00\x00\x01\x00\x08\x00\x03\x00\x00\x00' >&3 || exit 1
+    read -r -t 3 -n 1 -u 3 _
+) 2>/dev/null
+
+is_running() { docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; }
+
+stop_vm() {
+    notify "Shutting down the Windows VM..."
+    compose stop
+    notify "VM stopped."
+}
+
+cmd_start() {
+    command -v docker >/dev/null 2>&1 || die "docker is not installed"
+    docker info >/dev/null 2>&1 || die "cannot talk to Docker (is it running? are you in the docker group? log out and in after installing)"
+    load_config
+    : "${WF_USERNAME:?WF_USERNAME missing in $ENV_FILE}"
+    find_rdp_client || die "FreeRDP 3 not found (need xfreerdp3 or sdl-freerdp3)"
+    mkdir -p "$STATE_DIR"
+
+    # Only one instance at a time
+    exec 9>"$LOCK_FILE"
+    flock -n 9 || die "already running"
+
+    if [ "$WF_STOP_ON_EXIT" = "true" ]; then
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+        trap stop_vm EXIT
+    fi
+
+    notify "Starting the Windows VM..."
+    compose up -d || die "docker compose failed to start the VM"
+
+    echo "Waiting for Windows to answer on RDP ($RDP_HOST:$RDP_PORT)."
+    echo "First run installs Windows (20-40 min); watch it at http://127.0.0.1:8006"
+    local waited=0
+    until rdp_ready; do
+        if [ "$waited" -ge "$WF_BOOT_TIMEOUT" ]; then
+            die "Windows did not answer on RDP within $WF_BOOT_TIMEOUT s (see: docker logs $CONTAINER)"
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        if [ $((waited % 120)) -eq 0 ]; then echo "  still waiting ($((waited / 60)) min)..."; fi
+    done
+    sleep "$WF_BOOT_DELAY"   # RDP answers slightly before the desktop is ready
+
+    local args=("/v:$RDP_HOST:$RDP_PORT" "/u:$WF_USERNAME" /cert:tofu /dynamic-resolution
+               /clipboard +auto-reconnect "/title:Windows Forensics")
+    if [ -n "${WF_PASSWORD:-}" ]; then args+=("/p:$WF_PASSWORD"); fi   # empty = FreeRDP asks
+    if [ -n "$WF_RDP_FLAGS" ]; then
+        local extra
+        read -r -a extra <<< "$WF_RDP_FLAGS"
+        args+=("${extra[@]}")
+    fi
+
+    "$RDP_CLIENT" "${args[@]}" >"$LOG_FILE" 2>&1
+    # Leaving here runs the EXIT trap, which stops the VM.
+}
+
+cmd_doctor() {
+    local bad=0
+    ok()   { printf '  \033[32m[ ok ]\033[0m %s\n' "$1"; }
+    nok()  { printf '  \033[31m[FAIL]\033[0m %s\n' "$1"; bad=1; }
+    note() { printf '  \033[33m[warn]\033[0m %s\n' "$1"; }
+
+    echo "winforensics doctor"
+    if [ -e /dev/kvm ]; then
+        if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then ok "/dev/kvm accessible"; else nok "/dev/kvm exists but is not accessible (kvm group?)"; fi
+    else nok "/dev/kvm missing (enable VT-x/AMD-V in BIOS)"; fi
+
+    if command -v docker >/dev/null 2>&1; then
+        ok "docker installed"
+        if docker info >/dev/null 2>&1; then ok "docker daemon reachable"; else nok "cannot talk to Docker (daemon down, or not in the docker group)"; fi
+        if docker compose version >/dev/null 2>&1; then ok "docker compose plugin"; else nok "docker compose plugin missing"; fi
+    else nok "docker not installed"; fi
+
+    if find_rdp_client; then
+        ok "$RDP_CLIENT found ($("$RDP_CLIENT" --version 2>&1 | head -n1))"
+    else nok "FreeRDP 3 not found (need xfreerdp3 or sdl-freerdp3)"; fi
+
+    if [ -f "$ENV_FILE" ]; then
+        ok "config: $ENV_FILE"
+        if [ "$(stat -c '%a' "$ENV_FILE")" = "600" ]; then ok "config permissions 600"; else note "config should be chmod 600"; fi
+        load_config
+        if [ -n "${WF_USERNAME:-}" ]; then ok "WF_USERNAME set"; else nok "WF_USERNAME missing"; fi
+        if [ -n "${WF_PASSWORD:-}" ]; then ok "WF_PASSWORD set"; else note "WF_PASSWORD empty (FreeRDP will ask each time)"; fi
+    else nok "config missing: $ENV_FILE (run install.sh)"; fi
+
+    if [ -f "$CONF_DIR/compose.yaml" ]; then ok "compose.yaml present"; else nok "compose.yaml missing in $CONF_DIR"; fi
+    if command -v notify-send >/dev/null 2>&1; then ok "notify-send available"; else note "notify-send missing (optional, for desktop notifications)"; fi
+    if is_running; then ok "VM is running"; else echo "  [info] VM is not running"; fi
+
+    if [ "$bad" -eq 0 ]; then echo "All required checks passed."; else echo "Some checks failed."; return 1; fi
+}
+
+case "${1:-start}" in
+    start)  cmd_start ;;
+    stop)   load_config; compose stop ;;
+    status) if is_running; then echo running; else echo stopped; fi ;;
+    doctor) cmd_doctor ;;
+    help|-h|--help) usage ;;
+    *) usage; exit 2 ;;
+esac
